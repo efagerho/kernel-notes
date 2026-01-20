@@ -1,0 +1,2 @@
+default:
+	mdbook build
