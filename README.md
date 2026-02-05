@@ -6,3 +6,9 @@ installing `mdbook`
 ```
 cargo install mdbook
 ```
+
+After doing this, you can serve the book locally:
+
+```
+mdbook serve
+```
