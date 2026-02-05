@@ -2,3 +2,9 @@
 title = "Linux Kernel Notes"
 authors = ["Edvard Fagerholm"]
 language = "en"
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
+
+[output.html]
+additional-js = ["mermaid.min.js", "mermaid-init.js"]

@@ -1,8 +1,10 @@
-# Interrupts
+# Linux Interrupt Handling
 
 ## Overview
 
 Interrupts are a fundamental mechanism in the Linux kernel that allow hardware devices and the CPU itself to signal events that require immediate attention. Rather than polling devices constantly, the kernel can respond to events asynchronously as they occur.
+
+> **Note**: This chapter focuses on kernel software interrupt handling. For hardware-level details on APIC architecture, MSI/MSI-X mechanisms, interrupt routing, priorities, and latency breakdowns, see [Interrupts](./interrupts_hardware.md).
 
 Linux uses a **two-level interrupt handling model**:
 
@@ -11,6 +13,8 @@ Linux uses a **two-level interrupt handling model**:
 2. **Software Interrupts (Softirqs)**: Deferred work that can be processed later in a safer context. These allow the kernel to defer heavy processing out of the time-critical hardirq context.
 
 This split allows the kernel to acknowledge hardware quickly (in the hardirq) while deferring expensive processing (to softirqs), balancing responsiveness with throughput.
+
+**Terminology**: Hardirq handlers are often called the **"top half"** (or "top-level"), while softirqs and other deferred work mechanisms are called the **"bottom half"** (or "bottom-level"). This terminology reflects the two-level structure where the top half runs first in time-critical interrupt context, and the bottom half runs later in a less restrictive context.
 
 **Key principle**: Hardirqs do minimal work and defer everything else to softirqs or other bottom-half mechanisms.
 
@@ -87,12 +91,9 @@ The IDT is loaded into the CPU using the `lidt` instruction during kernel initia
 
 ### Interrupt Vector Allocation
 
-On AMD64, the CPU provides 256 interrupt vectors (0–255). Linux uses them roughly like this (exact allocation varies by kernel version, configuration, and platform):
+Linux dynamically allocates interrupt vectors (0-255) to device IRQs. While vectors 0-31 are reserved for CPU exceptions and high vectors for system IPIs, the kernel manages the remaining range for device interrupts.
 
-- **0–31**: Reserved for CPU-defined exceptions (page fault, divide error, etc.).
-- **0x20 (32) and up**: Typically used for external interrupts (device IRQs), but allocated dynamically.
-- **High vectors**: Reserved for local-APIC related purposes (IPIs, timers, special vectors). The exact ranges are not ABI-stable.
-- **0x80 (128)**: Historically used for `int 0x80` syscalls. On x86-64, the normal system call mechanism is `syscall`, so treat `0x80` as legacy/compat.
+> **Hardware Details**: For the specific hardware vector ranges, priority classes, and APIC routing mechanisms, see [Interrupts (Hardware)](./interrupts_hardware.md#vector-assignment).
 
 **IRQ to Vector Mapping**:
 
@@ -109,31 +110,19 @@ IRQ 5 (sound card) → APIC remapping → Vector 37 → IDT[37] → sound_interr
 - Allows interrupt routing and prioritization
 - Delivers interrupts to specific CPUs
 
+> For detailed APIC architecture, Local APIC registers, I/O APIC structure, x2APIC features, and interrupt routing mechanisms, see [Interrupts (Hardware)](./interrupts_hardware.md).
+
 ### Hardware Interrupt Flow
 
-When a device raises an interrupt, the following sequence occurs:
+When an interrupt is delivered to the CPU, the following sequence occurs:
+
+> **Hardware Path**: For the complete delivery flow from device to CPU (including PCIe TLP generation, I/O APIC routing, and LAPIC delivery), see [Interrupts (Hardware)](./interrupts_hardware.md#complete-delivery-flow).
 
 ```
-Device
-   │
-   │ Assert IRQ line
-   ▼
-APIC (I/O APIC)
-   │
-   │ Route to CPU's Local APIC
-   ▼
-CPU Local APIC
-   │
-   │ Interrupt vector determined
-   ▼
-CPU checks interrupts
-   │
-   │ IF flag = 1 (interrupts enabled)?
-   ▼
-CPU Interrupt
+CPU Interrupt (Vector N)
    │
    ├─ Save current RIP, RSP, RFLAGS
-   ├─ Look up vector in IDT
+   ├─ Look up vector N in IDT
    ├─ Load handler address
    ├─ Switch to kernel stack (if from user mode)
    └─ Jump to interrupt entry point
@@ -291,6 +280,1029 @@ static irqreturn_t my_network_interrupt(int irq, void *dev_id)
 - I/O operations
 - Memory allocations (use `GFP_ATOMIC` if necessary)
 - Wait for anything
+
+## Threaded Interrupts
+
+### Introduction and Motivation
+
+**Threaded interrupts** (also called **IRQ threading**) are a mechanism that allows interrupt handlers to execute in process context as kernel threads, rather than in hardirq context. This fundamental shift enables interrupt handlers to use operations that are prohibited in hardirq context, such as sleeping, taking mutexes, and performing lengthy operations.
+
+**The traditional problem**:
+
+In the traditional interrupt model, all device-specific work happens in hardirq context, which is extremely restrictive:
+
+```c
+/* Traditional handler - runs in hardirq context */
+static irqreturn_t my_handler(int irq, void *dev_id)
+{
+    /* Can't sleep! */
+    /* Can't take mutexes! */
+    /* Can't do I/O! */
+    /* Must be FAST! */
+    
+    read_device_status();
+    schedule_tasklet();  // Defer work
+    return IRQ_HANDLED;
+}
+```
+
+**The threaded solution**:
+
+With threaded interrupts, heavy work runs in a dedicated kernel thread that can be scheduled, preempted, and uses normal process context operations:
+
+```c
+/* Primary handler - runs in hardirq context (quick check) */
+static irqreturn_t my_primary_handler(int irq, void *dev_id)
+{
+    if (!is_my_interrupt(dev_id))
+        return IRQ_NONE;
+    
+    ack_device();
+    return IRQ_WAKE_THREAD;  // Wake the thread
+}
+
+/* Thread handler - runs in process context (can do anything) */
+static irqreturn_t my_thread_handler(int irq, void *dev_id)
+{
+    /* Can sleep! */
+    /* Can take mutexes! */
+    /* Can do I/O! */
+    /* Can take as long as needed! */
+    
+    mutex_lock(&dev->lock);
+    process_device_data(dev);
+    mutex_unlock(&dev->lock);
+    
+    return IRQ_HANDLED;
+}
+```
+
+**Why threaded interrupts were introduced**:
+
+1. **Real-time requirements**: Real-time systems need bounded, predictable latency. Non-preemptible hardirq handlers can cause unbounded delays. Threaded handlers can be preempted by higher-priority tasks.
+
+2. **Driver simplification**: Many devices require complex processing (I2C transactions, SPI transfers, etc.) that's awkward to split into hardirq and softirq/tasklet parts. Threading allows natural, straightforward code.
+
+3. **Better resource management**: Threaded handlers can be assigned priorities and CPU affinity, allowing fine-grained control over interrupt processing.
+
+4. **PREEMPT_RT**: The real-time Linux project (PREEMPT_RT) requires that nearly everything be preemptible. Threaded interrupts are essential for this.
+
+**Use cases**:
+
+- **Real-time systems**: Audio processing, industrial control, robotics
+- **Slow devices**: I2C/SMBus, SPI, UART where operations involve waiting
+- **Complex processing**: Network drivers with extensive protocol processing
+- **PREEMPT_RT kernels**: All interrupts are automatically threaded
+- **Desktop responsiveness**: Many distributions enable forced threading for better interactivity
+
+### API and Usage
+
+The kernel provides the `request_threaded_irq()` function for registering threaded interrupt handlers:
+
+```c
+/* From include/linux/interrupt.h */
+int request_threaded_irq(unsigned int irq,
+                        irq_handler_t handler,
+                        irq_handler_t thread_fn,
+                        unsigned long flags,
+                        const char *name,
+                        void *dev);
+```
+
+**Parameters**:
+
+- `irq`: The interrupt number to register
+- `handler`: Primary handler (optional, runs in hardirq context)
+- `thread_fn`: Thread handler (runs in process context)
+- `flags`: IRQ flags (including `IRQF_ONESHOT`)
+- `name`: Name for the interrupt (appears in `/proc/interrupts` and thread name)
+- `dev`: Device-specific pointer passed to both handlers
+
+**Primary handler** (`handler`):
+
+- Runs in hardirq context (fast, non-preemptible)
+- Should quickly check if this is the device's interrupt
+- Can be `NULL` if no quick check is needed
+- Return values:
+  - `IRQ_NONE`: Not our interrupt (shared IRQ line)
+  - `IRQ_HANDLED`: Handled, but don't wake thread
+  - `IRQ_WAKE_THREAD`: Handled, wake the thread handler
+
+**Thread handler** (`thread_fn`):
+
+- Runs in process context (can sleep, take mutexes, etc.)
+- Called when primary handler returns `IRQ_WAKE_THREAD`
+- Runs in a dedicated kernel thread (`irq/<n>-<name>`)
+- Fully preemptible and schedulable
+- Return values:
+  - `IRQ_HANDLED`: Successfully processed
+  - `IRQ_NONE`: Not handled (shouldn't normally happen)
+
+**The `IRQF_ONESHOT` flag**:
+
+This flag is **critical** for level-triggered interrupts with threaded handlers:
+
+```c
+request_threaded_irq(irq, primary, thread,
+                    IRQF_ONESHOT,  // Keep IRQ masked until thread completes
+                    "my_device", dev);
+```
+
+**Why `IRQF_ONESHOT` is needed**:
+
+```
+Without IRQF_ONESHOT (BAD for level-triggered):
+1. Device asserts IRQ line (level high)
+2. Primary handler runs, returns IRQ_WAKE_THREAD
+3. IRQ is re-enabled
+4. Device STILL asserting → immediate re-interrupt!
+5. Infinite interrupt storm before thread can run
+
+With IRQF_ONESHOT (CORRECT):
+1. Device asserts IRQ line
+2. Primary handler runs, returns IRQ_WAKE_THREAD
+3. IRQ stays MASKED
+4. Thread handler runs and clears device status
+5. Thread completes, IRQ is unmasked
+6. No spurious re-interrupts
+```
+
+For edge-triggered interrupts, `IRQF_ONESHOT` is not strictly necessary but is still commonly used.
+
+### Complete Driver Example
+
+Here's a realistic example of a threaded interrupt handler:
+
+```c
+/* Example: I2C device with interrupt */
+struct my_i2c_device {
+    struct i2c_client *client;
+    int irq;
+    struct mutex lock;
+    wait_queue_head_t wait;
+    u8 buffer[256];
+};
+
+/* Primary handler - runs in hardirq context */
+static irqreturn_t my_i2c_irq_primary(int irq, void *dev_id)
+{
+    struct my_i2c_device *dev = dev_id;
+    struct i2c_client *client = dev->client;
+    u8 status;
+    
+    /* Quick read of interrupt status register */
+    status = i2c_smbus_read_byte_data(client, REG_INT_STATUS);
+    
+    if (!(status & INT_DATA_READY))
+        return IRQ_NONE;  /* Not our interrupt */
+    
+    /* Acknowledge interrupt at device */
+    i2c_smbus_write_byte_data(client, REG_INT_STATUS, status);
+    
+    /* Wake the thread to do the real work */
+    return IRQ_WAKE_THREAD;
+}
+
+/* Thread handler - runs in process context */
+static irqreturn_t my_i2c_irq_thread(int irq, void *dev_id)
+{
+    struct my_i2c_device *dev = dev_id;
+    struct i2c_client *client = dev->client;
+    int ret, i;
+    
+    /*
+     * Can take mutex - would deadlock in hardirq context!
+     * Can sleep - would panic in hardirq context!
+     * Can do slow I2C transactions - would block hardirqs!
+     */
+    mutex_lock(&dev->lock);
+    
+    /* Read data from device (involves I2C transactions, can take ms) */
+    for (i = 0; i < sizeof(dev->buffer); i++) {
+        ret = i2c_smbus_read_byte_data(client, REG_DATA);
+        if (ret < 0) {
+            dev_err(&client->dev, "Failed to read data: %d\n", ret);
+            break;
+        }
+        dev->buffer[i] = ret;
+    }
+    
+    mutex_unlock(&dev->lock);
+    
+    /* Wake up any waiting readers */
+    wake_up_interruptible(&dev->wait);
+    
+    return IRQ_HANDLED;
+}
+
+/* Probe function - device initialization */
+static int my_i2c_probe(struct i2c_client *client)
+{
+    struct my_i2c_device *dev;
+    int ret;
+    
+    dev = devm_kzalloc(&client->dev, sizeof(*dev), GFP_KERNEL);
+    if (!dev)
+        return -ENOMEM;
+    
+    dev->client = client;
+    dev->irq = client->irq;
+    mutex_init(&dev->lock);
+    init_waitqueue_head(&dev->wait);
+    
+    /* Register threaded IRQ handler */
+    ret = request_threaded_irq(dev->irq,
+                              my_i2c_irq_primary,    /* Primary (hardirq) */
+                              my_i2c_irq_thread,     /* Thread (process) */
+                              IRQF_ONESHOT |         /* Keep masked until thread done */
+                              IRQF_TRIGGER_FALLING,  /* Falling edge */
+                              "my_i2c_device",       /* Name */
+                              dev);                  /* Device data */
+    if (ret) {
+        dev_err(&client->dev, "Failed to request IRQ: %d\n", ret);
+        return ret;
+    }
+    
+    i2c_set_clientdata(client, dev);
+    return 0;
+}
+
+static void my_i2c_remove(struct i2c_client *client)
+{
+    struct my_i2c_device *dev = i2c_get_clientdata(client);
+    
+    free_irq(dev->irq, dev);
+}
+```
+
+**Alternative: Thread-only handler**:
+
+If no quick check is needed, pass `NULL` for the primary handler:
+
+```c
+/* Only thread handler, no primary */
+ret = request_threaded_irq(irq,
+                          NULL,              /* No primary handler */
+                          my_thread_only,    /* Only thread handler */
+                          IRQF_ONESHOT,
+                          "my_device",
+                          dev);
+```
+
+In this case, the kernel provides a minimal primary handler that just returns `IRQ_WAKE_THREAD`.
+
+### Kernel Implementation Details
+
+#### Thread Creation
+
+When you call `request_threaded_irq()`, the kernel creates a dedicated kernel thread for the interrupt handler. Here's how it works:
+
+```c
+/* Simplified from kernel/irq/manage.c */
+int request_threaded_irq(unsigned int irq, irq_handler_t handler,
+                        irq_handler_t thread_fn, unsigned long irqflags,
+                        const char *devname, void *dev_id)
+{
+    struct irqaction *action;
+    struct irq_desc *desc;
+    int retval;
+    
+    /* Allocate irqaction structure */
+    action = kzalloc(sizeof(struct irqaction), GFP_KERNEL);
+    if (!action)
+        return -ENOMEM;
+    
+    action->handler = handler;       /* Primary handler */
+    action->thread_fn = thread_fn;   /* Thread handler */
+    action->flags = irqflags;
+    action->name = devname;
+    action->dev_id = dev_id;
+    
+    /* Get IRQ descriptor */
+    desc = irq_to_desc(irq);
+    if (!desc) {
+        kfree(action);
+        return -EINVAL;
+    }
+    
+    /* Setup the IRQ and create thread if needed */
+    retval = __setup_irq(irq, desc, action);
+    if (retval)
+        kfree(action);
+    
+    return retval;
+}
+```
+
+The `__setup_irq()` function creates the kernel thread:
+
+```c
+/* Simplified from kernel/irq/manage.c */
+static int __setup_irq(unsigned int irq, struct irq_desc *desc,
+                      struct irqaction *new)
+{
+    struct task_struct *t;
+    
+    /* If there's a thread function, create the kernel thread */
+    if (new->thread_fn) {
+        /* Create kernel thread for this IRQ */
+        t = kthread_create(irq_thread, new, "irq/%d-%s",
+                          irq, new->name);
+        if (IS_ERR(t))
+            return PTR_ERR(t);
+        
+        /* Set scheduling policy and priority */
+        sched_set_fifo(t);  /* SCHED_FIFO, high priority */
+        
+        /* Store thread pointer */
+        new->thread = t;
+        
+        /* Setup completion for thread synchronization */
+        init_completion(&new->thread_completion);
+        wake_up_process(t);
+    }
+    
+    /* Add action to the IRQ descriptor's action list */
+    /* ... */
+    
+    return 0;
+}
+```
+
+**Thread naming convention**:
+
+Threads are named `irq/<irq_number>-<device_name>`:
+
+```bash
+$ ps -eLo pid,tid,comm | grep 'irq/'
+    3    3 irq/9-acpi
+   12   12 irq/16-i801_smb
+  240  240 irq/129-eth0
+  241  241 irq/130-eth0-TxRx-0
+  242  242 irq/131-eth0-TxRx-1
+```
+
+#### The IRQ Thread Function
+
+Each IRQ thread runs the `irq_thread()` function in a loop:
+
+```c
+/* Simplified from kernel/irq/manage.c */
+static int irq_thread(void *data)
+{
+    struct irqaction *action = data;
+    struct irq_desc *desc = irq_to_desc(action->irq);
+    irqreturn_t ret;
+    
+    /* Thread loop */
+    while (!kthread_should_stop()) {
+        /* Sleep until woken by primary handler */
+        wait_for_completion(&action->thread_completion);
+        
+        /* Check if we should stop */
+        if (kthread_should_stop())
+            break;
+        
+        /* Call the thread handler */
+        ret = irq_thread_fn(desc, action);
+        
+        /* If IRQF_ONESHOT, unmask the interrupt now */
+        if (action->flags & IRQF_ONESHOT) {
+            /* Unmask interrupt at chip level */
+            desc->irq_data.chip->irq_unmask(&desc->irq_data);
+        }
+        
+        /* Mark completion done for next iteration */
+        reinit_completion(&action->thread_completion);
+    }
+    
+    return 0;
+}
+
+/* Call the actual thread handler function */
+static irqreturn_t irq_thread_fn(struct irq_desc *desc,
+                                struct irqaction *action)
+{
+    irqreturn_t ret;
+    
+    /* Mark that we're in IRQ thread context */
+    local_bh_disable();
+    
+    /* Call the driver's thread handler */
+    ret = action->thread_fn(action->irq, action->dev_id);
+    
+    local_bh_enable();
+    
+    return ret;
+}
+```
+
+**Key points**:
+
+1. The thread sleeps on a completion variable
+2. When the primary handler returns `IRQ_WAKE_THREAD`, it wakes the thread
+3. Thread calls the driver's `thread_fn`
+4. If `IRQF_ONESHOT` is set, interrupt is unmasked after thread completes
+5. Thread goes back to sleep, waiting for next interrupt
+
+#### Interrupt Handling Flow
+
+When a threaded interrupt occurs, the primary handler runs in hardirq context to acknowledge the device (and mask it if `IRQF_ONESHOT`), then wakes the kernel thread. The thread runs later in process context to perform the actual work.
+
+> **Visual Flow**: For a detailed comparison of the traditional vs. threaded interrupt flow, see [Comparison: Traditional vs. Threaded vs. Forced Threading](#comparison-traditional-vs-threaded-vs-forced-threading).
+
+**Detailed code path**:
+
+```c
+/* Hardware interrupt occurs → entry_64.S → common_interrupt → ... */
+
+/* From kernel/irq/handle.c */
+irqreturn_t __handle_irq_event_percpu(struct irq_desc *desc)
+{
+    irqreturn_t retval = IRQ_NONE;
+    struct irqaction *action;
+    
+    for_each_action_of_desc(desc, action) {
+        irqreturn_t res;
+        
+        /* Call primary handler */
+        res = action->handler(desc->irq_data.irq, action->dev_id);
+        
+        /* Check return value */
+        switch (res) {
+        case IRQ_WAKE_THREAD:
+            /* Mask if ONESHOT */
+            if (action->flags & IRQF_ONESHOT) {
+                desc->irq_data.chip->irq_mask(&desc->irq_data);
+                desc->threads_oneshot |= action->thread_mask;
+            }
+            
+            /* Wake the thread */
+            __irq_wake_thread(desc, action);
+            
+            fallthrough;
+        case IRQ_HANDLED:
+            retval |= res;
+            break;
+        default:
+            break;
+        }
+    }
+    
+    return retval;
+}
+
+/* Wake the IRQ thread */
+static void __irq_wake_thread(struct irq_desc *desc,
+                             struct irqaction *action)
+{
+    /*
+     * Wake the handler thread. The completion is used to
+     * synchronize between the primary handler and the thread.
+     */
+    complete(&action->thread_completion);
+}
+```
+
+The scheduler then runs the IRQ thread when appropriate based on its priority and the system load.
+
+### Process Visibility
+
+Threaded interrupts create visible kernel threads that appear in process listings:
+
+```bash
+$ ps -eLo pid,tid,class,rtprio,pri,comm | grep 'irq/'
+  PID   TID CLS RTPRIO PRI COMMAND
+    3     3  FF     50  90 irq/9-acpi
+   12    12  FF     50  90 irq/16-i801_smb
+  240   240  FF     50  90 irq/129-eth0
+  241   241  FF     50  90 irq/130-eth0-TxRx-0
+  242   242  FF     50  90 irq/131-eth0-TxRx-1
+  243   243  FF     50  90 irq/132-eth0-TxRx-2
+  244   244  FF     50  90 irq/133-eth0-TxRx-3
+```
+
+**Understanding the output**:
+
+- `PID/TID`: Process/Thread ID
+- `CLS`: Scheduling class
+  - `FF` = SCHED_FIFO (real-time, first-in-first-out)
+  - `TS` = SCHED_NORMAL (regular time-sharing)
+- `RTPRIO`: Real-time priority (0-99, higher = more priority)
+- `PRI`: Kernel's internal priority value
+- `COMMAND`: Thread name (`irq/<num>-<name>`)
+
+**IRQ thread properties**:
+
+1. **Real-time scheduling**: By default, IRQ threads use `SCHED_FIFO` with priority 50
+2. **High priority**: Preempt regular processes but not higher-priority RT tasks
+3. **Per-IRQ threads**: One thread per interrupt line (or per MSI-X vector)
+4. **Visible in tools**: Show up in `ps`, `top`, `htop`, `perf`, etc.
+
+> For details on MSI-X hardware capabilities, vector allocation, and per-queue interrupt mechanisms, see [Interrupts (Hardware)](./interrupts_hardware.md).
+
+**Managing IRQ threads**:
+
+You can adjust IRQ thread priority and affinity:
+
+```bash
+# Set IRQ thread priority
+$ chrt -f -p 60 $(pgrep -f 'irq/129-eth0')
+
+# Set IRQ thread CPU affinity
+$ taskset -cp 2,3 $(pgrep -f 'irq/129-eth0')
+
+# Check current settings
+$ chrt -p $(pgrep -f 'irq/129-eth0')
+pid 240's current scheduling policy: SCHED_FIFO
+pid 240's current scheduling priority: 50
+
+$ taskset -cp $(pgrep -f 'irq/129-eth0')
+pid 240's current affinity list: 0-7
+```
+
+**Monitoring IRQ threads**:
+
+```bash
+# See IRQ thread CPU usage
+$ top -H -p $(pgrep -f 'irq/' | tr '\n' ',' | sed 's/,$//')
+
+# Trace IRQ thread activity
+$ perf record -e 'irq:*' -g -p $(pgrep -f 'irq/129-eth0')
+
+# See IRQ thread wakeups
+$ trace-cmd record -e sched:sched_wakeup -f comm~'irq/*'
+```
+
+**Comparison with `/proc/interrupts`**:
+
+```bash
+$ cat /proc/interrupts
+           CPU0       CPU1       CPU2       CPU3
+  9:          0          0          0          0   IO-APIC   9-fasteoi   acpi
+ 16:        156        234        198        211   IO-APIC  16-fasteoi   i801_smbus
+129:      45234      48967      46123      47890   PCI-MSI 524288-edge      eth0
+130:      12456      11234      12789      13456   PCI-MSI 524289-edge      eth0-TxRx-0
+```
+
+The interrupt numbers match the IRQ thread names (`irq/129-eth0`, etc.).
+
+### Forced Threading
+
+The kernel provides mechanisms to force ALL interrupts to use threading, even if drivers didn't explicitly request it.
+
+#### CONFIG_IRQ_FORCED_THREADING
+
+At compile time, enable this kernel configuration option:
+
+```kconfig
+CONFIG_IRQ_FORCED_THREADING=y
+```
+
+This adds support for forced threading but doesn't automatically enable it. You must still use the boot parameter or runtime control.
+
+#### Boot Parameter
+
+Force threading at boot time:
+
+```bash
+# Add to kernel command line
+threadirqs
+
+# Example in GRUB:
+linux /vmlinuz-5.15.0 root=/dev/sda1 threadirqs
+```
+
+This makes ALL interrupts use threading, regardless of how drivers registered them.
+
+#### Runtime Control
+
+Enable/disable forced threading at runtime:
+
+```bash
+# Enable forced threading
+$ echo 1 > /proc/sys/kernel/force_irqthreads
+
+# Disable forced threading (only affects new IRQ registrations)
+$ echo 0 > /proc/sys/kernel/force_irqthreads
+
+# Check current setting
+$ cat /proc/sys/kernel/force_irqthreads
+0
+```
+
+**Important**: Changing this at runtime only affects IRQs registered AFTER the change. Existing IRQs keep their current threading mode.
+
+#### How Forced Threading Works
+
+When forced threading is enabled:
+
+```c
+/* Simplified from kernel/irq/manage.c */
+static int __setup_irq(unsigned int irq, struct irq_desc *desc,
+                      struct irqaction *new)
+{
+    /* Check if threading should be forced */
+    if (force_irqthreads) {
+        /* If driver didn't provide thread_fn, create a wrapper */
+        if (!new->thread_fn) {
+            /* Use primary handler as thread handler */
+            new->thread_fn = new->handler;
+            
+            /* Replace primary with generic stub */
+            new->handler = irq_default_primary_handler;
+        }
+        
+        /* Force ONESHOT flag */
+        new->flags |= IRQF_ONESHOT;
+    }
+    
+    /* ... rest of setup, including thread creation ... */
+}
+
+/* Generic primary handler for forced threading */
+static irqreturn_t irq_default_primary_handler(int irq, void *dev_id)
+{
+    /* Just wake the thread */
+    return IRQ_WAKE_THREAD;
+}
+```
+
+**Effect**:
+
+```c
+/* Original driver code: */
+request_irq(irq, my_handler, flags, "my_device", dev);
+
+/* With forced threading, kernel transforms it to: */
+request_threaded_irq(irq,
+                    irq_default_primary_handler,  /* Stub */
+                    my_handler,                    /* Moves to thread */
+                    flags | IRQF_ONESHOT,
+                    "my_device",
+                    dev);
+```
+
+All processing moves to the thread, with only a minimal stub in hardirq context.
+
+#### PREEMPT_RT Behavior
+
+On **PREEMPT_RT kernels**, forced threading is automatic and mandatory:
+
+```c
+/* From kernel/irq/manage.c with CONFIG_PREEMPT_RT */
+#ifdef CONFIG_PREEMPT_RT
+static const bool force_irqthreads = true;
+#else
+static bool force_irqthreads;
+#endif
+```
+
+**PREEMPT_RT requirements**:
+
+1. Nearly everything must be preemptible for hard real-time guarantees
+2. All interrupts are threaded (except a few critical ones like timer, IPI)
+3. IRQ threads can be prioritized above application threads
+4. Bounded worst-case latency (<100μs typical)
+
+**Checking if running PREEMPT_RT**:
+
+```bash
+$ uname -a | grep PREEMPT_RT
+Linux hostname 5.15.0-rt48 #1 SMP PREEMPT_RT Mon Jan 1 12:00:00 UTC 2024 x86_64
+
+$ cat /sys/kernel/realtime
+1
+```
+
+### Performance Considerations
+
+#### Advantages of Threaded Interrupts
+
+1. **Fully Preemptible Handlers**: Interrupt work can be preempted by higher-priority real-time tasks, ensuring bounded latency.
+2. **Priority-Based Scheduling**: IRQ threads can be assigned priorities (using `chrt`) relative to application threads.
+3. **Better Real-Time Latency**: Worst-case latency is significantly reduced (e.g., from milliseconds to microseconds) as hardirq sections are minimized.
+4. **Clearer Accounting**: IRQ threads appear as distinct processes in `top` and `ps`, making CPU usage visible.
+5. **Simplified Locking**: Handlers run in process context, allowing them to sleep, take mutexes, and perform I/O without complex workarounds.
+
+#### Disadvantages of Threaded Interrupts
+
+1. **Context Switch Overhead**: Waking and switching to a thread costs ~2000-5000 cycles, compared to ~100-200 cycles for a hardirq.
+2. **Higher Latency**: The handler does not run immediately; it must be scheduled. This adds 5-50 μs of latency depending on load.
+3. **Tuning Complexity**: Requires managing thread priorities and affinity to avoid priority inversion or starvation.
+4. **Reduced Peak Throughput**: The higher per-interrupt overhead consumes more CPU cycles, potentially limiting maximum packet/IO rates.
+5. **Scheduler Dependency**: Handler execution is subject to scheduler decisions and lock contention, unlike hardirqs which run immediately.
+
+#### When to Use Threaded Interrupts
+
+**Use threaded interrupts when**:
+
+1. **Real-time requirements**: Need bounded latency for RT tasks
+2. **Slow devices**: I2C, SPI, UART where transactions take milliseconds
+3. **Complex processing**: Handler needs to take locks, do I/O, sleep
+4. **Low-frequency interrupts**: < 10,000 interrupts/second
+5. **PREEMPT_RT kernel**: Required for RT guarantees
+6. **Driver simplification**: Threading makes code more straightforward
+
+**DON'T use threaded interrupts when**:
+
+1. **High-frequency interrupts**: > 100,000 interrupts/second
+2. **Minimal processing**: Handler only reads a register and sets a flag
+3. **Latency-critical acknowledgment**: Device requires immediate ACK
+4. **Maximum throughput needed**: Every cycle counts
+5. **Simple hardirq handlers**: Already fast enough without threading
+
+**Hybrid approach (best of both)**:
+
+Many drivers use a hybrid model:
+
+```c
+/* Fast path in primary handler */
+static irqreturn_t my_primary(int irq, void *dev_id)
+{
+    u32 status = readl(dev->regs + STATUS);
+    
+    if (status & FAST_PATH_BIT) {
+        /* Handle fast path immediately */
+        handle_fast_path(dev);
+        return IRQ_HANDLED;  /* Don't wake thread */
+    }
+    
+    /* Slow path needs thread */
+    return IRQ_WAKE_THREAD;
+}
+
+static irqreturn_t my_thread(int irq, void *dev_id)
+{
+    /* Handle slow path in thread */
+    handle_slow_path(dev);
+    return IRQ_HANDLED;
+}
+```
+
+**Result**: Fast path has low latency, slow path gets flexibility.
+
+#### Performance Benchmarks
+
+**Synthetic microbenchmark** (null interrupt handler):
+
+```
+Hardware: Intel Core i7-9700K @ 3.6GHz
+Kernel: 5.15.0
+
+Test: Trigger interrupt, measure handler completion time
+
+Traditional (hardirq):
+    Min: 0.8 μs
+    Avg: 1.2 μs
+    Max: 2.5 μs
+    Throughput: ~800k interrupts/sec @ 50% CPU
+
+Threaded IRQ:
+    Min: 4.2 μs
+    Avg: 8.5 μs
+    Max: 45 μs (scheduler delays)
+    Throughput: ~115k interrupts/sec @ 50% CPU
+```
+
+**Real-world workload** (network driver, 10GbE):
+
+```
+Test: Network throughput and latency
+
+Traditional (NAPI + softirq):
+    Throughput: 9.8 Gbps
+    P50 latency: 45 μs
+    P99 latency: 450 μs
+    CPU usage: 35%
+
+Threaded IRQ (forced):
+    Throughput: 8.9 Gbps (-9%)
+    P50 latency: 52 μs
+    P99 latency: 95 μs (better!)
+    CPU usage: 42% (+20% overhead)
+```
+
+**Key insight**: Threaded IRQs reduce peak throughput but improve worst-case latency.
+
+**Audio workload** (real-time audio processing):
+
+```
+Test: Jack audio server, 64-sample buffer @ 48kHz (1.3ms deadline)
+
+Without IRQ threading:
+    Xruns (buffer underruns): 12 per hour
+    Worst-case latency: 2.8ms (deadline miss)
+
+With IRQ threading + PREEMPT_RT:
+    Xruns: 0 per hour
+    Worst-case latency: 0.9ms (well under deadline)
+```
+
+**Result**: Threaded IRQs enable reliable real-time audio.
+
+### Comparison: Traditional vs. Threaded vs. Forced Threading
+
+Here's a visual comparison of the three interrupt handling models:
+
+#### Traditional Interrupt Model
+
+```
+Device raises interrupt
+    ↓
+Hardware interrupt path
+    ↓
+┌──────────────────────────────┐
+│   Hardirq Handler            │ ← Non-preemptible
+│   - Read device status       │   ~100-200 cycles
+│   - Acknowledge interrupt    │
+│   - Schedule softirq         │
+└──────────────────────────────┘
+    ↓
+Return from interrupt
+    ↓
+┌──────────────────────────────┐
+│   Softirq Processing         │ ← Non-preemptible
+│   - Process device data      │   Can take ms
+│   - Run protocol stack       │   (or defer to ksoftirqd)
+└──────────────────────────────┘
+    ↓
+Work complete
+
+Characteristics:
+✓ Fast (~1μs handler latency)
+✓ High throughput
+✗ Non-preemptible (unbounded latency for other tasks)
+✗ Can't sleep or use mutexes
+```
+
+#### Threaded Interrupt Model (Explicit)
+
+```
+Device raises interrupt
+    ↓
+Hardware interrupt path
+    ↓
+┌──────────────────────────────┐
+│   Primary Handler            │ ← Non-preemptible
+│   - Quick status check       │   ~100 cycles
+│   - Acknowledge if needed    │
+│   - Return IRQ_WAKE_THREAD   │
+└──────────────────────────────┘
+    ↓
+If IRQF_ONESHOT: Mask interrupt
+    ↓
+Wake IRQ thread
+    ↓
+Return from interrupt (fast!)
+    ↓
+┌──────────────────────────────┐
+│   IRQ Thread (Process        │ ← PREEMPTIBLE!
+│   Context)                   │   Runs when scheduled
+│   - Process device data      │   Priority: SCHED_FIFO 50
+│   - Can sleep, use mutexes   │
+│   - Can do I/O               │
+└──────────────────────────────┘
+    ↓
+If IRQF_ONESHOT: Unmask interrupt
+    ↓
+Work complete
+
+Characteristics:
+✓ Preemptible (bounded latency for RT tasks)
+✓ Can sleep, use mutexes, do I/O
+✓ Clear accounting in tools
+✗ Slower (~5-10μs handler latency)
+✗ Context switch overhead
+```
+
+#### Forced Threading Model
+
+```
+Device raises interrupt
+    ↓
+Hardware interrupt path
+    ↓
+┌──────────────────────────────┐
+│   Generic Stub Handler       │ ← Minimal work
+│   - Just return              │   ~50 cycles
+│     IRQ_WAKE_THREAD          │
+└──────────────────────────────┘
+    ↓
+Mask interrupt (IRQF_ONESHOT automatic)
+    ↓
+Wake IRQ thread
+    ↓
+Return from interrupt (very fast!)
+    ↓
+┌──────────────────────────────┐
+│   IRQ Thread (Process        │ ← Everything here
+│   Context)                   │   Fully preemptible
+│   - ALL interrupt work       │   Priority: SCHED_FIFO 50
+│   - Read device status       │
+│   - Process data             │
+│   - Everything from original │
+│     handler                  │
+└──────────────────────────────┘
+    ↓
+Unmask interrupt
+    ↓
+Work complete
+
+Characteristics:
+✓ Maximum preemptibility
+✓ Minimal hardirq time
+✓ Uniform model for all IRQs
+✗ Highest overhead
+✗ May break drivers that assume hardirq context
+```
+
+### Interaction with Other Mechanisms
+
+#### Threaded IRQs and Softirqs
+
+Threaded IRQs and softirqs are alternative bottom-half mechanisms:
+
+```
+Traditional:  Hardirq → Softirq → Work
+Threaded:     Hardirq → IRQ Thread → Work
+```
+
+Many drivers use both:
+
+```c
+static irqreturn_t my_primary(int irq, void *dev_id)
+{
+    /* Quick check */
+    if (simple_condition) {
+        raise_softirq(NET_RX_SOFTIRQ);  /* Use softirq for simple case */
+        return IRQ_HANDLED;
+    }
+    
+    return IRQ_WAKE_THREAD;  /* Use thread for complex case */
+}
+```
+
+#### Threaded IRQs and NAPI
+
+Network drivers often combine threaded IRQs with NAPI:
+
+```c
+/* Primary handler disables interrupts, schedules NAPI */
+static irqreturn_t eth_primary(int irq, void *dev_id)
+{
+    struct net_device *ndev = dev_id;
+    
+    /* Disable device interrupts */
+    eth_disable_interrupts(ndev);
+    
+    /* Schedule NAPI polling */
+    napi_schedule(&ndev->napi);
+    
+    return IRQ_HANDLED;  /* No thread needed */
+}
+
+/* NAPI poll runs in softirq context */
+static int eth_poll(struct napi_struct *napi, int budget)
+{
+    /* Process packets... */
+}
+```
+
+Some drivers use threads for control path, NAPI for data path.
+
+#### Threaded IRQs and Workqueues
+
+Workqueues vs. IRQ threads:
+
+```c
+/* IRQ thread: For interrupt-driven work */
+request_threaded_irq(irq, primary, thread, flags, name, dev);
+/* Thread wakes immediately when interrupt occurs */
+
+/* Workqueue: For deferred work not tied to interrupts */
+schedule_work(&work);
+/* Work runs when workqueue thread schedules it */
+```
+
+**When to use each**:
+- **IRQ thread**: Work must happen in response to interrupt
+- **Workqueue**: Periodic work, deferred non-critical work
+
+Some drivers use both:
+
+```c
+static irqreturn_t my_thread(int irq, void *dev_id)
+{
+    /* Handle interrupt */
+    process_interrupt_data(dev);
+    
+    /* Schedule additional work for later */
+    schedule_delayed_work(&dev->cleanup_work, HZ);
+    
+    return IRQ_HANDLED;
+}
+```
 
 ## Interrupt Context Management
 
@@ -1202,17 +2214,13 @@ queue_work(my_wq, &work);
 ### Interrupt Latency
 
 Interrupt latency is the time from when an interrupt occurs to when its handler starts executing.
-Factors affecting latency:
 
-1. **Other interrupts**: Higher-priority interrupts delay lower-priority ones
-2. **Interrupt disabled sections**: Code with `local_irq_disable()` delays all interrupts
-3. **NMI handling**: NMIs delay regular interrupts
-4. **Hardware delays**: APIC routing, bus delays
+> **Hardware Latency**: For detailed hardware breakdowns (PCIe, APIC, MSI-X timing), see [Interrupts (Hardware)](./interrupts_hardware.md#performance-summary).
 
-Typical latencies (on modern hardware):
-- Best case: ~1-2 microseconds
-- Typical: 5-20 microseconds
-- With interrupt disabled: Can be milliseconds
+**Software Factors**:
+1. **Interrupt Disabled Sections**: Code running with `local_irq_disable()` blocks delivery.
+2. **Other Interrupts**: Higher-priority handlers pre-empt or delay lower-priority ones.
+3. **Context Switch Overhead**: Saving registers and switching stacks.
 
 Measuring latency:
 
@@ -1256,7 +2264,7 @@ NET_RX: 45678      47890      46123      48234
 BLOCK:   5432       5678       5234       5890
 ```
 
-Modern kernels support IRQ threading (`CONFIG_IRQ_FORCED_THREADING`), which moves interrupt handlers to kernel threads:
+Modern kernels support IRQ threading (`CONFIG_IRQ_FORCED_THREADING`), which moves interrupt handlers to kernel threads. See the [Threaded Interrupts](#threaded-interrupts) section for comprehensive coverage of how this works.
 
 ```bash
 # Force all interrupts to threads
@@ -1503,260 +2511,34 @@ With very fast storage (NVMe), BLOCK_SOFTIRQ can consume significant CPU time, d
 
 ### Alternatives and Improvements
 
-The kernel community has developed several alternatives and mitigations:
+The kernel community has developed several alternatives and mitigations to address softirq limitations:
 
-#### 1. IRQ Threading (PREEMPT_RT Approach)
+#### 1. IRQ Threading & PREEMPT_RT
+Converting interrupt handlers to kernel threads allows them to be preempted and prioritized. This is the default in **PREEMPT_RT** kernels and available in standard kernels via `threadirqs`.
+> See [Threaded Interrupts](#threaded-interrupts) for details.
 
-The **most radical alternative**: convert all interrupt handlers to kernel threads.
+#### 2. NAPI & Networking
+NAPI (New API) switches from interrupt-driven to polling mode under load, preventing interrupt storms and reducing softirq pressure.
+> See [NICs](./nics.md) for NAPI architecture and configuration.
 
-```c
-/* Traditional model */
-Interrupt → Hardirq handler → Softirq (non-preemptible)
+#### 3. Workqueues
+For work that is not strictly latency-critical or needs to sleep, **workqueues** are preferred over tasklets/softirqs.
+> See [Work Queues](#work-queues).
 
-/* Threaded IRQ model */
-Interrupt → Wake thread → Done
-              ↓
-         Thread handler (schedulable, preemptible)
-```
+#### 4. CPU Isolation
+Isolating CPUs (`isolcpus`) allows dedicating cores to real-time tasks, keeping them free from softirq interference.
+> See [Interrupts (Hardware)](./interrupts_hardware.md#cpu-isolation) for configuration.
 
-**Advantages**:
-- Handlers are fully preemptible
-- Priority can be assigned to each IRQ thread
-- Better real-time behavior
-- Clearer accounting in tools
-
-**Disadvantages**:
-- Higher overhead (context switch per interrupt)
-- Lower peak throughput
-- More complex to tune
-
-**Enabling**:
-```bash
-# Force all interrupts to use threading
-echo 1 > /proc/sys/kernel/force_irqthreads
-
-# Or build with CONFIG_PREEMPT_RT
-```
-
-Many distributions now use threaded IRQs for better desktop responsiveness.
-
-#### 2. NAPI for Networking
-
-**NAPI** (New API) largely solved the network receive livelock problem by changing drivers from interrupt-per-packet to **polling under load**:
-
-```c
-/* Old model (pre-NAPI) */
-Packet arrives → Interrupt → Process one packet → Done
-(Could cause livelock under high load)
-
-/* NAPI model (modern) */
-Packet arrives → Interrupt → Disable interrupts → Start polling
-                             Process many packets in batch
-                             When queue empty: Re-enable interrupts
-```
-
-This dramatically reduced softirq load from networking. **NAPI is now standard** in all modern network drivers and has effectively solved the receive livelock problem for networking. However, NAPI is **network-specific** and doesn't help other subsystems that can still experience similar issues (storage, serial devices, etc.).
-
-#### 3. XDP and eBPF
-
-**XDP** (eXpress Data Path) processes packets even earlier, before softirqs:
-
-```
-Packet → Driver → XDP program (eBPF)
-                    ↓
-                  Drop/Redirect/Pass
-                    ↓ (if Pass)
-                  Softirq (NET_RX)
-```
-
-XDP can handle millions of packets per second with minimal CPU, often bypassing softirqs entirely. This addresses networking latency but is again network-specific.
-
-#### 4. Workqueues for Deferrable Work
-
-Modern drivers increasingly use **workqueues** instead of tasklets:
-
-```c
-/* Old approach: tasklet */
-tasklet_schedule(&my_tasklet);  /* Runs in TASKLET_SOFTIRQ */
-
-/* New approach: workqueue */
-queue_work(system_wq, &my_work);  /* Runs in process context */
-```
-
-**Benefits**:
-- Can sleep, use mutexes
-- Schedulable (can be preempted)
-- Better visibility in tools
-- Can be assigned to specific CPUs
-
-**When to use**:
-- Work can take >1ms
-- Need to sleep or block
-- Not extremely latency-sensitive
-
-#### 5. Per-Subsystem Solutions
-
-Rather than using generic softirqs, subsystems increasingly implement their own threading:
-
-**Examples**:
-- **Block layer**: `kblockd` workqueue for I/O completion
-- **RCU**: Dedicated `rcuc/N` threads per CPU
-- **Networking**: Per-device threads for some drivers
-
-This provides better isolation and control than shared softirq mechanism.
-
-### Modern Kernel Solutions
-
-Recent kernels have improved the situation:
-
-#### 1. Better ksoftirqd Behavior
-
-Modern kernels wake `ksoftirqd` more aggressively:
-
-```c
-/* Newer behavior */
-if (pending) {
-    if (time_before(jiffies, end) && !need_resched() && --max_restart)
-        goto restart;
-    
-    wakeup_softirqd();  /* Wake immediately */
-}
-```
-
-Earlier kernels would continue processing longer before yielding to `ksoftirqd`.
-
-#### 2. CONFIG_PREEMPT_RT
-
-The PREEMPT_RT patchset (partially merged in recent kernels) provides:
-
-- Threaded interrupts by default
-- Preemptible softirqs (controversial!)
-- Better latency bounds (<100μs typical)
-
-**Trade-off**: Lower peak throughput but bounded latency.
-
-#### 3. CPU Isolation
-
-Users can isolate CPUs for dedicated workloads:
-
-```bash
-# Boot parameter: isolate CPUs 2-7 from softirqs
-isolcpus=2-7
-
-# All softirqs run on CPUs 0-1
-# CPUs 2-7 available for real-time tasks
-```
-
-This doesn't fix the softirq mechanism but provides a workaround.
-
-#### 4. Improved Monitoring
-
-Better tools for observing softirq impact:
-
-```bash
-# Per-softirq statistics
-cat /proc/softirqs
-
-# Latency tracking
-trace-cmd record -e irq:softirq_entry -e irq:softirq_exit
-
-# Per-CPU softirq time
-mpstat -P ALL 1
-```
+#### 5. Per-Subsystem Threading
+Subsystems like the Block layer (`kblockd`) and RCU (`rcuc/N`) use dedicated per-CPU threads instead of the shared softirq mechanism to improve isolation.
 
 ### Best Practices for Driver Developers
 
-Given the criticism, what should driver developers do?
-
-#### 1. Minimize Softirq Work
-
-Do as little as possible in softirq context:
-
-```c
-/* BAD: Heavy processing in tasklet */
-void my_tasklet_func(unsigned long data)
-{
-    process_large_dataset();      /* Takes milliseconds */
-    do_complex_computation();     /* Non-preemptible! */
-}
-
-/* GOOD: Defer to workqueue */
-void my_tasklet_func(unsigned long data)
-{
-    queue_work(my_wq, &my_work);  /* Quick handoff */
-}
-
-void my_work_func(struct work_struct *work)
-{
-    process_large_dataset();      /* Preemptible */
-    do_complex_computation();     /* Can be scheduled */
-}
-```
-
-#### 2. Consider Workqueues First
-
-Modern advice: **default to workqueues** unless you have specific latency requirements:
-
-```c
-/* Use workqueues unless: */
-/* 1. Need <1ms latency */
-/* 2. Work takes <100μs */
-/* 3. Cannot sleep/block */
-```
-
-#### 3. Use Threaded IRQs
-
-Request threaded IRQ handlers when possible:
-
-```c
-/* Instead of: */
-request_irq(irq, my_handler, flags, name, dev);
-
-/* Use: */
-request_threaded_irq(irq, my_quick_check, my_thread_handler,
-                    flags, name, dev);
-```
-
-The `my_thread_handler` runs in process context, fully preemptible.
-
-#### 4. Batch Work
-
-If you must use softirqs, batch work to reduce overhead:
-
-```c
-/* BAD: Raise softirq for each item */
-for_each_item(item) {
-    raise_softirq(MY_SOFTIRQ);
-}
-
-/* GOOD: Accumulate, raise once */
-list_splice(&items, &pending_list);
-raise_softirq(MY_SOFTIRQ);
-```
-
-#### 5. Consider NAPI-Style Polling
-
-For high-rate events, implement polling with interrupts as a fallback:
-
-```c
-/* Interrupt handler */
-static irqreturn_t my_handler(int irq, void *dev)
-{
-    disable_device_interrupts(dev);
-    schedule_poll_work(dev);
-    return IRQ_HANDLED;
-}
-
-/* Poll work */
-static void my_poll_work(struct work_struct *work)
-{
-    while (device_has_data(dev)) {
-        process_data(dev);
-        cond_resched();  /* Allow preemption */
-    }
-    enable_device_interrupts(dev);
-}
-```
+1. **Prefer Workqueues**: Default to workqueues unless latency requirements (<1ms) strictly demand softirqs.
+2. **Use Threaded IRQs**: Request `request_threaded_irq()` to move work to preemptible process context.
+3. **Minimize Softirq Work**: Keep softirq handlers fast; offload heavy computation to process context.
+4. **Batch Operations**: Accumulate work and raise softirq once rather than for every item.
+5. **Implement Polling**: For high-rate events, use NAPI-style polling to avoid interrupt storms.
 
 ### The Ongoing Debate
 
